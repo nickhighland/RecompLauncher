@@ -8,6 +8,8 @@ pub mod ach;
 pub mod adopt;
 pub mod xex;
 mod appimage;
+#[cfg(target_os = "linux")]
+mod appimage_update;
 pub mod art;
 pub mod assets;
 pub mod boot;
@@ -23,12 +25,14 @@ pub mod gamefiles;
 pub mod games;
 pub mod flatpak;
 pub mod gamebanana;
+pub mod hoard;
 pub mod info;
 pub mod inputs;
 pub mod ingame;
 pub mod install;
 pub mod library;
 pub mod looks;
+pub mod mac_update;
 pub mod manage;
 pub mod macos;
 pub mod media;
@@ -6165,12 +6169,15 @@ fn linux_entry(v: &Value) -> Option<Value> {
         return None;
     }
     let mut out = v.clone();
-    for k in ["version", "url", "sha256", "notes"] {
+    // A Linux download must never inherit the Windows checksum or required minimum.
+    for k in ["linux", "macos", "url", "sha256", "min", "size"] {
+        out.as_object_mut()?.remove(k);
+    }
+    for k in ["version", "url", "sha256", "notes", "min", "size"] {
         if let Some(x) = l.get(k) {
             out[k] = x.clone();
         }
     }
-    out.as_object_mut()?.remove("linux");
     Some(out)
 }
 
@@ -6880,25 +6887,59 @@ async fn beta_feedback(st: State<'_, App>, kind: String, area: String, mood: Opt
     }
 }
 
+/// A launcher download the updater may fetch: HTTPS from GitHub or recomplauncher.com, or from the
+/// update server itself (`base`, which RL_API can point at a local http copy of the site for
+/// testing). Matched by origin and path, so github.com.evil.example or a sibling path doesn't pass.
+pub(crate) fn trusted_update_url(raw: &str, base: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(raw) else { return false };
+    if !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() {
+        return false;
+    }
+    let under = |origin: &str| {
+        let Ok(origin) = reqwest::Url::parse(origin) else { return false };
+        let prefix = format!("{}/", origin.path().trim_end_matches('/'));
+        url.origin() == origin.origin() && url.path().starts_with(&prefix)
+    };
+    ["https://github.com", net::SITE, base].into_iter().any(under)
+}
+
 /// Download the newer launcher, check it, and start it: the installer on Windows, the AppImage in
-/// place of this one on Linux. Anything else opens the download page.
+/// place of this one on Linux, the .app from the disk image in place of this one on a Mac. Anything
+/// else opens the download page.
 #[tauri::command]
-async fn update_launcher(app: AppHandle, st: State<'_, App>) -> Res<()> {
+async fn update_launcher(app: AppHandle, st: State<'_, App>, big_picture: Option<bool>) -> Res<()> {
+    let result = update_launcher_inner(&app, &st, big_picture).await;
+    if result.is_err() {
+        let _ = app.emit("self-update", json!({"failed": true}));
+    }
+    result
+}
+
+async fn update_launcher_inner(app: &AppHandle, st: &App, _big_picture: Option<bool>) -> Res<()> {
     if flatpak::sandboxed() {
         return Err(Error::Msg("RecompLauncher updates through Flatpak. Update it from your software center, or run: flatpak update".into()));
     }
     let v = version_json(&st, 600, true).await.ok_or_else(|| Error::Net("Can't reach recomplauncher.com right now. Try again in a bit.".into()))?;
     let page = format!("{}/download", net::SITE);
     // On Linux an AppImage replaces itself; anything else (a .deb) opens the download page.
-    let appimage = if cfg!(target_os = "linux") { std::env::var_os("APPIMAGE").map(PathBuf::from).filter(|p| p.is_file()) } else { None };
     let v = launcher_platform_entry(&v, assets::os_now(), assets::arch_now()).unwrap_or(Value::Null);
+    #[cfg(target_os = "linux")]
+    if let Some(target) = std::env::var_os("APPIMAGE") {
+        // An AppImage reports missing/invalid metadata in the launcher and can be retried there.
+        // A missing image on disk is an error too, not a reason to open a browser.
+        return appimage_update::update(app, st, Path::new(&target), &v, _big_picture.unwrap_or_else(|| BIG_PICTURE.load(Ordering::Relaxed))).await;
+    }
     let file_url = str_of(&v, "url").to_string();
-    let ok_host = file_url.starts_with("https://github.com/") || file_url.starts_with(&format!("{}/", net::SITE)) || file_url.starts_with(&format!("{}/", catalog::base().trim_end_matches('/')));
-    if cfg!(target_os = "macos") {
-        // Mac builds are downloaded and installed by the player; no in-place updater yet.
+    let ok_host = trusted_update_url(&file_url, &catalog::base());
+    // On a Mac the app replaces itself from the release's disk image, when this account can change
+    // the folder it's in. Otherwise (run from the disk image, or from a folder only an administrator
+    // can change) the player gets the disk image to drag in themselves.
+    let mac_app = if cfg!(target_os = "macos") { mac_update::running_bundle().filter(|b| mac_update::can_replace(b)) } else { None };
+    let mac_dmg = file_url.to_ascii_lowercase().ends_with(".dmg");
+    if cfg!(target_os = "macos") && (mac_app.is_none() || !mac_dmg) {
         return open_thing(&app, if ok_host { &file_url } else { &page }, true);
     }
-    if !(cfg!(windows) || appimage.is_some()) || file_url.is_empty() || !ok_host {
+    if !(cfg!(windows) || mac_app.is_some()) || file_url.is_empty() || !ok_host {
         return open_thing(&app, &page, true);
     }
     let mut r = update_download::response(&st.http, &file_url).await?;
@@ -6932,23 +6973,34 @@ async fn update_launcher(app: AppHandle, st: State<'_, App>) -> Res<()> {
         trail::note(format!("The update file for {to_ver} is another version; not offered again"));
         return Err(Error::Msg(format!("The update file for RecompLauncher {to_ver} looks wrong: it's a different version inside. It won't be offered again until it's fixed, and nothing on your PC needs changing.")));
     }
-    if let Some(me) = appimage {
-        // The new AppImage goes next to this one and takes its place, then starts.
-        let new = me.with_extension("new");
-        std::fs::write(&new, &bytes).map_err(|e| Error::Msg(format!("Couldn't save the new version next to this one: {e}")))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&new, std::fs::Permissions::from_mode(0o755))?;
+    if let Some(bundle) = mac_app {
+        let dmg = std::env::temp_dir().join(format!("RecompLauncher-{to_ver}.dmg"));
+        std::fs::write(&dmg, &bytes).map_err(|e| Error::Msg(format!("Couldn't save the new version: {e}")))?;
+        let (dmg2, bundle2, ver2) = (dmg.clone(), bundle.clone(), to_ver.clone());
+        let put = tokio::task::spawn_blocking(move || mac_update::install(&dmg2, &bundle2, &ver2)).await.map_err(|e| Error::Msg(e.to_string()))?;
+        let _ = std::fs::remove_file(&dmg);
+        match put {
+            Ok(()) => {}
+            Err(mac_update::Failed::OtherVersion(found)) => {
+                update_strike(&st.dir, &to_ver, &file_url, &want, 2);
+                trail::note(format!("The update file for {to_ver} holds {found}; not offered again"));
+                return Err(Error::Msg(format!("The update file for RecompLauncher {to_ver} looks wrong: it's a different version inside. It won't be offered again until it's fixed, and nothing on your Mac needs changing.")));
+            }
+            Err(mac_update::Failed::Msg(m)) => return Err(Error::Msg(m)),
         }
-        std::fs::rename(&new, &me).map_err(|e| {
-            let _ = std::fs::remove_file(&new);
-            Error::Msg(format!("Couldn't replace RecompLauncher with the new version: {e}"))
-        })?;
-        if reopen_after_update(&app) {
-            let mut c = std::process::Command::new(&me);
-            sysenv::clean_std(&mut c);
-            c.spawn().map_err(|e| Error::Msg(format!("The new version is in place, but it didn't start: {e}. Open RecompLauncher again.")))?;
+        trail::note(format!("Updated to {to_ver} in place"));
+        if !reopen_after_update(&app) {
+            mac_update::forget_old(&bundle);
+            app.exit(0);
+            return Ok(());
+        }
+        // Noted, so that if the new version fails to start and this one is put back, its next
+        // start tells the player (see update_check_last). No installer to run again on a Mac.
+        let _ = std::fs::write(st.dir.join("update-pending.json"), json!({"to": to_ver, "from": env!("CARGO_PKG_VERSION"), "at": now(), "installer": "", "url": file_url, "sha256": want}).to_string());
+        if let Err(e) = mac_update::start_and_watch(&bundle) {
+            mac_update::forget_old(&bundle);
+            let _ = std::fs::remove_file(st.dir.join("update-pending.json"));
+            return Err(Error::Msg(format!("The new version is in place, but it didn't start: {e}. Open RecompLauncher again.")));
         }
         app.exit(0);
         return Ok(());
@@ -7015,6 +7067,7 @@ fn get_state(st: State<'_, App>) -> Value {
         "pictures": ingame::shots_dir("").parent().map(|p| p.to_string_lossy().to_string()),
         "deck": shortcuts::is_steam_deck(),
         "bigArg": std::env::args().any(|a| a == "--bigpicture"),
+        "desktopArg": std::env::args().any(|a| a == "--desktop"),
         "missing": missing,
         // Where the web view can't play a sound (an AppImage, run as one or unpacked, or a PC
         // without GStreamer's base plugins) it stops the moment one starts. The page then plays none.
@@ -7079,14 +7132,20 @@ fn update_retry(app: AppHandle) -> Res<()> {
 }
 
 #[tauri::command(async)]
-fn save_settings(st: State<'_, App>, settings: Settings) -> Res<()> {
+fn save_settings(app: AppHandle, st: State<'_, App>, settings: Settings) -> Res<()> {
     if settings.library_dir.as_os_str().is_empty() || !settings.library_dir.is_absolute() {
         return Err(Error::Msg("Pick a folder for the library.".into()));
     }
     if settings.library_dirs.iter().chain(settings.rom_dirs.iter()).any(|d| !d.is_absolute()) {
         return Err(Error::Msg("Pick folders, not names.".into()));
     }
+    if settings.hoard_dir.as_ref().is_some_and(|d| !d.is_absolute()) {
+        return Err(Error::Msg("Pick a folder for Data Hoarder Mode, not a name.".into()));
+    }
     let mut l = st.lib.lock().unwrap();
+    let hoarding = l.settings.hoarder;
+    let hoard_root = l.settings.hoard_root();
+    let hoard_before = (l.settings.hoard_this_pc_only, l.settings.hoard_keep.clone(), l.settings.hoard_count);
     let told = l.settings.tray_told;
     // The saves folder changes only through its own button (the copies move with it).
     let save_dir = l.settings.save_dir.clone();
@@ -7098,7 +7157,33 @@ fn save_settings(st: State<'_, App>, settings: Settings) -> Res<()> {
     (l.settings.proxy, l.settings.proxy_url, l.settings.proxy_user, l.settings.proxy_pass) = proxy;
     pads::STICK.store(l.settings.pad_stick, Ordering::Relaxed);
     l.save(&st.dir)?;
+    // Data Hoarder Mode: turning it on (or pointing it at another folder, or changing which
+    // platforms or how many releases it keeps) starts a sweep; turning it off stops the one running.
+    let (on, root) = (l.settings.hoarder, l.settings.hoard_root());
+    let hoard_after = (l.settings.hoard_this_pc_only, l.settings.hoard_keep.clone(), l.settings.hoard_count);
+    drop(l);
+    if hoarding && !on {
+        hoard::stop();
+    }
+    if on && (!hoarding || root != hoard_root || hoard_after != hoard_before) {
+        hoard::stop();
+        hoard::kick(&app);
+    }
     Ok(())
+}
+
+/// Data Hoarder Mode's state for the Settings page: whether a sweep is running, what it's saving,
+/// and what couldn't be saved.
+#[tauri::command]
+fn hoard_state() -> hoard::Status {
+    hoard::status()
+}
+
+/// Sweep now (Settings → Data Hoarder Mode → Save Now, and after a game is added to the Library
+/// or updates are checked). Does nothing while the mode is off.
+#[tauri::command]
+fn hoard_now(app: AppHandle) {
+    hoard::kick(&app);
 }
 
 /// Settings → Network: the proxy every request goes through. `pass` None keeps the saved one; the
@@ -7261,6 +7346,7 @@ fn reset_settings(st: State<'_, App>, what: String) -> Res<Settings> {
                 share_stats: old.share_stats,
                 data_asked: old.data_asked,
                 save_dir: old.save_dir.clone(),
+                hoard_dir: old.hoard_dir.clone(),
                 ui: Value::Object(keep),
                 ..Settings::default()
             };
@@ -8012,6 +8098,10 @@ pub fn run() {
             }
             trail::start(&dir);
             update_check_last(&dir);
+            #[cfg(target_os = "linux")]
+            if let Some(image) = std::env::var_os("APPIMAGE") {
+                appimage_update::clean_stale(Path::new(&image));
+            }
             // Downloads slow down while a game is running (if the player wants that).
             {
                 let h = app.handle().clone();
@@ -8116,7 +8206,7 @@ pub fn run() {
                 let _ = lib.save(&dir);
             }
             // Big Picture at start only once setup is done: the first-run setup is always in a window.
-            let tv = (lib.settings.start_in_tv || std::env::args().any(|a| a == "--bigpicture")) && lib.settings.setup_done;
+            let tv = !std::env::args().any(|a| a == "--desktop") && (lib.settings.start_in_tv || std::env::args().any(|a| a == "--bigpicture")) && lib.settings.setup_done;
             // ReShade left in a game's folder by a start that didn't finish (the launcher closed
             // while the game ran): taken away now.
             {
@@ -8211,6 +8301,8 @@ pub fn run() {
             cloud::watch_inbox(app.handle().clone());
             // Settings → Keep Steam in Sync: written whenever Steam is found closed.
             steam_sync::start(app.handle().clone());
+            // Settings → Data Hoarder Mode: keeps every release of the games in the Library.
+            hoard::start(app.handle().clone());
             // A new RecompLauncher: the window looks as it opens; after that, every six hours or so
             // while it runs (it may stay by the clock). A push brings news of a new build sooner.
             {
@@ -8322,13 +8414,13 @@ pub fn run() {
             take_setup_asked,
             get_state, get_catalog, get_releases, net_state, check_updates, launcher_update, install, cancel, uninstall, play, stop, set_exe, open_folder,
             save_settings, open_url, libraries, move_game, game_sizes, backups, backup_now, restore_backup, pc_check, set_ui_scale, update_retry, ge_proton_install, proton_now, repo_readme, install_vcredist, scan_roms, rom_matches, copy_files, support_local,
-            desktop_shortcut, open_app_control, fs_paste, portable_info, make_portable, add_to_steam, launcher_to_steam, steam_sync::steam_sync_now, steam_sync::steam_sync_state, recent_log, screenshots, open_shots, overlay_action, overlay_state, is_handheld, skip_backup, set_cover, art::art_source, art::art_open, art::art_save, art::art_search, art::art_for, all_screenshots, delete_screenshot,
+            desktop_shortcut, open_app_control, fs_paste, portable_info, make_portable, add_to_steam, launcher_to_steam, steam_sync::steam_sync_now, steam_sync::steam_sync_state, hoard_state, hoard_now, recent_log, screenshots, open_shots, overlay_action, overlay_state, is_handheld, skip_backup, set_cover, art::art_source, art::art_open, art::art_save, art::art_search, art::art_for, all_screenshots, delete_screenshot,
             copy_screenshot, show_screenshot, controllers, prefetch_images, versions, build_check, news, game_info, mods_state, mods_online,
             mod_install, mod_remove, open_mods, send_report, beta_feedback, game_programs, run_program, game_root, boot::boot_builtin, update_launcher, resume_game, game_setup, set_game_copy, set_update_copy, set_game_setting, set_game_slider, set_game_binding, reset_game_bindings, usage::report_preview, usage::profile_report, usage::my_reports, usage::report_reply,
             recomp_games, adopt::move_listing, update_info, set_proxy, umu_repair, dlss_fetch, dlss_set, dlss_state, dlss_remove, cloud::library_pull, cloud::library_push, cloud::saves_open_backups, game_action, setup_copy, setup_cancel, setup_input_set, setup_key_remove, setup_inputs_run, easy_setup, set_game_options, looks_info, set_look, look_picture, ui_data,
             reset_settings, tray::tray_words, ach::ach_access, ach::ach_status, ach::ach_apply, ach::ach_profile, ach::ach_games, ach::ach_board, ach::ach_game_web, ach::ach_report, ach::ach_tracker_get, ach::ach_game, ach::ach_set_disc, ach::ach_sound, ach::ach_log, ach::ach_peek, ach::ach_rule, ach::ach_reset, ach::ach_test_toast, ach::ach_toast_take, ach::ach_toast_done, cloud::account_start, cloud::account_poll, cloud::account_cancel, cloud::account_state, cloud::account_signout,
             cloud::saves_check, cloud::saves_pick, cloud::saves_cloud, download_history, report_counts, play_reports, cloud::saves_info, cloud::saves_upload_now, cloud::cloud_retry, cloud::saves_overview, cloud::saves_backup, cloud::saves_restore, cloud::saves_share, cloud::saves_forget_found, cloud::saves_set_place, cloud::saves_add_place, cloud::saves_remove_place, cloud::saves_open, saves_set_root, saves_open_root, missing_files, missing_made, dll_check, dll_aside, gpu_choice, prefer_fast_gpu, copy_check, wine_tools, deck_scores, team_notes, usage::notifies, usage::notify, usage::pc_specs, usage::recomp_request,
-            adopt::adopt_scan, adopt::adopt_pick, adopt::adopt_add, adopt::adopt_check, adopt::set_project, usage::usage_hello, usage::usage_event, usage::data_ids, usage::reset_ids, ping::usage_open, ping::usage_mode, usage::run_report, cloud::inbox, cloud::inbox_done, cloud::betas, cloud::beta_join, cloud::beta_leave, launcher_notes, scan_info, devtools::dev_add, devtools::add_any, devtools::dev_check, devtools::dev_starter, fs_places, fs_list, fs_extract, gb_mods, gb_mod, gb_install
+            adopt::adopt_scan, adopt::migrate_scan, adopt::migrate_pick, adopt::adopt_pick, adopt::adopt_add, adopt::adopt_check, adopt::set_project, usage::usage_hello, usage::usage_event, usage::data_ids, usage::reset_ids, ping::usage_open, ping::usage_mode, usage::run_report, cloud::inbox, cloud::inbox_done, cloud::betas, cloud::beta_join, cloud::beta_leave, launcher_notes, scan_info, devtools::dev_add, devtools::add_any, devtools::dev_check, devtools::dev_starter, fs_places, fs_list, fs_extract, gb_mods, gb_mod, gb_install
         ])
         .build(tauri::generate_context!())
         .expect("RecompLauncher couldn't start")
@@ -8954,6 +9046,31 @@ mod tests {
         assert!(launcher_platform_entry(&feed, "macos", "arm64").is_none());
         assert_eq!(launcher_platform_entry(&feed, "windows", "x64").unwrap()["url"], "https://example.com/windows.exe");
         assert_eq!(launcher_platform_entry(&feed, "linux", "x64").unwrap()["url"], "https://example.com/linux.AppImage");
+    }
+
+    #[test]
+    fn launcher_update_downloads_only_from_trusted_places() {
+        let base = "http://127.0.0.1:8787/api";
+        for ok in ["https://github.com/o/r/releases/download/v1/a.exe", "https://recomplauncher.com/launcher/a.exe", "http://127.0.0.1:8787/api/launcher/a.exe"] {
+            assert!(trusted_update_url(ok, base), "{ok}");
+        }
+        for bad in ["http://github.com/a.exe", "https://github.com.evil.example/a.exe", "https://name@github.com/a.exe", "https://github.com/a.exe#x", "http://127.0.0.1:8787/api-evil/a.exe", "not a url"] {
+            assert!(!trusted_update_url(bad, base), "{bad}");
+        }
+    }
+
+    #[test]
+    fn linux_launcher_update_uses_its_own_checksum_and_minimum() {
+        let feed = json!({"version":"999.0", "sha256":"windows-sha", "min":"999.0", "size":12,
+            "linux":{"url":"https://github.com/owner/repo/Launcher.AppImage"}});
+        let linux = linux_entry(&feed).unwrap();
+        assert_eq!(linux["version"], "999.0");
+        for key in ["sha256", "min", "size", "linux"] { assert!(linux.get(key).is_none(), "{key}"); }
+        let mut own = feed;
+        own["linux"]["sha256"] = json!("linux-sha");
+        own["linux"]["min"] = json!("1.0");
+        assert_eq!(linux_entry(&own).unwrap()["sha256"], "linux-sha");
+        assert_eq!(linux_entry(&own).unwrap()["min"], "1.0");
     }
 
     #[test]

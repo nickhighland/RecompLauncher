@@ -136,7 +136,9 @@ const favs = () => ((S.settings.ui && S.settings.ui.favs) || []).filter((id) => 
 // A word that means different things in different places ("Light" as a theme, not a strength):
 // its key carries the context after a bar, and English shows only the word.
 const tc = (k) => { const v = t(k); return v === k ? k.split('|')[0] : v; };
-const saveUi = (patch, quiet) => saveSettings({ ui: Object.assign({}, S.settings.ui || {}, patch) }, quiet);
+// A change to the Library's added games (every way of adding one goes through here) wakes Data Hoarder
+// Mode once it's saved, which is when its sweep can see the new game.
+const saveUi = (patch, quiet) => saveSettings({ ui: Object.assign({}, S.settings.ui || {}, patch) }, quiet).then(() => { if (patch && 'saved' in patch) hoardNow(); });
 // Download speed limits the player can pick (MB a second; 0 is none), sent to the app at start and
 // whenever they change.
 const DL_LIMITS = [0, 1, 2, 5, 10, 25, 50];
@@ -2757,6 +2759,8 @@ document.addEventListener('input', (e) => {
 });
 document.addEventListener('change', (e) => {
   const el = e.target;
+  if (el.matches('[data-act="hoard-keep"]')) { saveSettings({ hoard_keep: el.value }); return; }
+  if (el.id === 'hoard-count') { const n = Math.max(1, Math.min(999, Math.floor(Number(el.value)) || 5)); saveSettings({ hoard_count: n }); return; }
   if (el.matches('[data-act="dl-limit"]')) { saveUi({ dl_limit: Number(el.value) || 0 }).then(sendLimits); return; }
   if (el.matches('[data-act="proxy-mode"]')) { if (el.value === 'custom') { S.proxyMode = 'custom'; setSection('updates', false); } else saveProxy(el.value); return; }
   if (el.matches('[data-lk-amount]')) {
@@ -3275,6 +3279,7 @@ const SET_ICONS = {
   general: '<path d="M4 7h9M17 7h3M4 17h3M11 17h9"/><circle cx="15" cy="7" r="2.2"/><circle cx="9" cy="17" r="2.2"/>',
   library: '<path d="M3 6.5A1.5 1.5 0 0 1 4.5 5H10l2 2.5h7.5A1.5 1.5 0 0 1 21 9v9.5a1.5 1.5 0 0 1-1.5 1.5h-15A1.5 1.5 0 0 1 3 18.5z"/>',
   updates: '<path d="M20 12a8 8 0 1 1-2.3-5.6M20 4v5h-5"/>',
+  bring: '<path d="M12 3v11M7.5 9.5 12 14l4.5-4.5"/><path d="M4 14v4.5A1.5 1.5 0 0 0 5.5 20h13a1.5 1.5 0 0 0 1.5-1.5V14"/>',
   look: '<circle cx="12" cy="12" r="8.5"/><path d="M12 3.5v17M12 3.5a8.5 8.5 0 0 1 0 17" fill="currentColor"/>',
   bigpicture: '<rect x="2.5" y="4.5" width="19" height="13" rx="2.5"/><path d="M8 21h8"/><path d="m10.5 8.5 4 2.5-4 2.5z" fill="currentColor"/>',
   pads: '<path d="M7 9h10a4 4 0 0 1 3.9 4.9l-.8 3.4a2 2 0 0 1-3.5.8L15 16H9l-1.6 2.1a2 2 0 0 1-3.5-.8l-.8-3.4A4 4 0 0 1 7 9z"/><path d="M8.5 11.5v3M7 13h3"/>',
@@ -3312,7 +3317,7 @@ async function saveProxy(mode) {
     if (S.view === 'settings') setSection('updates', false);
   } catch (e) { fail(e); }
 }
-const SET_SECTIONS = [['general', N_('General')], ['report', N_('Report a Problem')], ['beta', N_('Beta')], ['account', N_('Account')], ['library', N_('Games and folders')], ['updates', N_('Updates and downloads')], ['playing', N_('While Playing')], ['look', N_('Appearance')], ['bigpicture', N_('Big Picture mode')], ['plugins', N_('Plugins')], ['pads', N_('Controllers')], ['pc', N_('Your PC')], ['dev', N_('Developers')], ['about', N_('About')]];
+const SET_SECTIONS = [['general', N_('General')], ['report', N_('Report a Problem')], ['beta', N_('Beta')], ['account', N_('Account')], ['library', N_('Games and folders')], ['bring', N_('Bring Your Games')], ['updates', N_('Updates and downloads')], ['playing', N_('While Playing')], ['look', N_('Appearance')], ['bigpicture', N_('Big Picture mode')], ['plugins', N_('Plugins')], ['pads', N_('Controllers')], ['pc', N_('Your PC')], ['dev', N_('Developers')], ['about', N_('About')]];
 // Microsoft's Visual C++ runtime, installed by the launcher (its installer's own small window
 // shows the progress, and Windows may ask for permission).
 let vcBusy = false;
@@ -3407,10 +3412,13 @@ function pageSettings() {
         + group(t('Desktop shortcuts'), row(t('Shortcuts Go Through the Launcher'), t('Off: a game\'s desktop shortcut starts the game itself, for front ends like RetroBat. On: it opens the launcher, which brings your shader, cloud saves and play time along.'), sw('shortcut_launcher', ui.shortcut_launcher, t('Shortcuts Go Through the Launcher'), 'ui-toggle')))
         + (S.steam ? steamSyncGroup(group, row, sw) : '')
         + (S.os === 'windows' ? group(t('Picking files'), row(t('Use the Launcher\'s Own File Browser'), t('Off: Windows\' own window for picking files and folders. On: the launcher\'s, which marks the games it knows and can unzip.'), sw('own_picker', ui.own_picker, t('Use the Launcher\'s Own File Browser'), 'ui-toggle'))) : '')
-        + group(t('Recomps you already have'), row(t('Bring them into the Library'), t('Recomps you added to Steam, installed with Quiver Launcher or keep in a folder. They update from here after that, in the same folder.'), `<button type="button" class="btn sm" data-act="adopt">${esc(t('Find them'))}</button>`))
+        + group(t('Recomps you already have'), row(t('Bring them into the Library'), t('Games from another launcher, Steam or a folder. They update from here after that, in the same folder.'), `<button type="button" class="btn sm" data-act="mig-open">${esc(t('Bring Your Games'))}</button>`))
         + dlssGroup(group, row)
         + group(t('Game Art'), `<div class="set-row"><div class="k"><b>${esc(t('SteamGridDB API Key'))}</b><span>${esc(t('Optional. With your own free key from steamgriddb.com (Preferences → API), games you add from GitHub get covers, backgrounds and logos.'))}</span></div>
           <span class="acts"><input class="field sm" id="sgdb-key" type="password" autocomplete="off" spellcheck="false" value="${esc(ui.sgdb_key || '')}" aria-label="${esc(t('SteamGridDB API Key'))}"><button type="button" class="btn sm" data-act="sgdb-save">${esc(t('Save'))}</button></span></div>`);
+      break;
+    case 'bring':
+      body = window.migratePage ? window.migratePage(group) : '';
       break;
     case 'updates':
       body = group(t('Updates'), row(t('Check for Updates'), t('Asks each installed game\'s GitHub for a newer release now.'), `<button type="button" class="btn sm main" data-act="check-upd">${esc(t('Check now'))}</button>`)
@@ -3419,6 +3427,7 @@ function pageSettings() {
         + group(t('Downloads'), row(t('Keep downloaded files'), t('Off: the zip is deleted once it\'s unpacked. On: it stays in the library\'s .downloads folder.'), sw('keep_downloads', st.keep_downloads, t('Keep downloaded files')))
           + row(t('Speed Limit'), t('Keeps downloads under this speed, so the rest of your home\'s internet stays quick.'), `<select class="sel" data-act="dl-limit" aria-label="${esc(t('Speed Limit'))}">${DL_LIMITS.map((n) => `<option value="${n}"${Number(ui.dl_limit || 0) === n ? ' selected' : ''}>${esc(n ? tf('{n} MB/s', { n }) : t('No Limit'))}</option>`).join('')}</select>`)
           + row(t('Slow Down While Playing'), t('While a game is running, downloads keep to 4 MB/s so the game gets your internet and drive first.'), sw('dl_slow_play', ui.dl_slow_play !== false, t('Slow Down While Playing'), 'dl-slow')))
+        + hoarderGroup(group, row, sw, st)
         + networkGroup(group, row, st);
       break;
     case 'playing': {
@@ -4057,7 +4066,7 @@ function paintProgress(id) {
 // ---------- talking to the core ----------
 async function refreshState() {
   const st = await invoke('get_state');
-  Object.assign(S, { os: st.os, arch: st.arch, flatpak: !!st.flatpak, version: st.version, site: st.site, thumbs: st.thumbs || '', library: st.library || {}, arts: st.arts || {}, settings: st.settings || {}, roms: st.roms || [], steam: !!st.steam, deck: !!st.deck, bigArg: !!st.bigArg, noSound: !!st.noSound });
+  Object.assign(S, { os: st.os, arch: st.arch, flatpak: !!st.flatpak, version: st.version, site: st.site, thumbs: st.thumbs || '', library: st.library || {}, arts: st.arts || {}, settings: st.settings || {}, roms: st.roms || [], steam: !!st.steam, deck: !!st.deck, bigArg: !!st.bigArg, desktopArg: !!st.desktopArg, noSound: !!st.noSound });
   document.body.classList.toggle('linux', S.os === 'linux');
   document.body.classList.toggle('mac', S.os === 'macos');
   document.body.classList.toggle('cpu-draw', !!st.cpuDraw);
@@ -4159,6 +4168,7 @@ async function checkUpdates(loud) {
     if (revision !== updateCheckRevision) return false;
     S.updates = Object.fromEntries(Object.entries(updates).filter(([id]) => S.library[id] && !S.library[id].local));
     S.updInfo = {};
+    hoardNow();
   } catch (e) { if (loud) fail(e); return false; }
   renderSide();
   if (window.tvRefresh && document.body.classList.contains('tv-on')) window.tvRefresh();
@@ -5298,6 +5308,28 @@ function updateFailedModal(f) {
     <div class="acts"><button type="button" class="btn main" data-x="no">${esc(t('OK'))}</button></div>`, () => {}, t('This Update Looks Wrong'));
     return;
   }
+  // On a Mac there's no installer: the new app was put in place, didn't start, and this one was
+  // put back. Downloading it again is the only thing to offer.
+  if (S.os === 'macos') {
+    modal(`<h2>${esc(t('The Update Didn\'t Start'))}</h2><p>${esc(tf('RecompLauncher {to} was put in place but didn\'t start, so {now} was put back. You can try the update again, or download it from recomplauncher.com.', { to: verName(f.to), now: verName(S.version) }))}</p>
+    <div class="acts grid2"><button type="button" class="btn" data-x="no">${esc(t('Not Now'))}</button><button type="button" class="btn main" data-x="go">${esc(t('Try Again'))}</button></div>`, (x, close) => {
+      if (x.dataset.x !== 'go') return;
+      close();
+      selfUpdate();
+    }, t('The Update Didn\'t Start'));
+    return;
+  }
+  // On Linux there's no installer: a helper swaps the AppImage once the launcher closes. This is
+  // still the old version, so the swap didn't happen or the new one didn't start and was put back.
+  if (S.os === 'linux') {
+    modal(`<h2>${esc(t('The Update Didn\'t Start'))}</h2><p>${esc(tf('RecompLauncher {to} didn\'t go in or didn\'t start, so this is still {now}. You can try the update again, or download it from recomplauncher.com.', { to: verName(f.to), now: verName(S.version) }))}</p>
+    <div class="acts grid2"><button type="button" class="btn" data-x="no">${esc(t('Not Now'))}</button><button type="button" class="btn main" data-x="go">${esc(t('Try Again'))}</button></div>`, (x, close) => {
+      if (x.dataset.x !== 'go') return;
+      close();
+      selfUpdate();
+    }, t('The Update Didn\'t Start'));
+    return;
+  }
   modal(`<h2>${esc(t('The Update Didn\'t Install'))}</h2><p>${esc(tf('RecompLauncher {to} was downloaded, but it didn\'t install, so this is still {now}. Run its installer the usual way to see what\'s stopping it, like an antivirus or a folder Windows protects.', { to: verName(f.to), now: verName(S.version) }))}</p>
     <div class="acts grid2"><button type="button" class="btn" data-x="no">${esc(t('Not Now'))}</button><button type="button" class="btn main" data-x="go">${esc(f.there ? t('Run the Installer') : t('Download It Again'))}</button></div>`, async (x, close) => {
     if (x.dataset.x !== 'go') return;
@@ -5307,8 +5339,29 @@ function updateFailedModal(f) {
   }, t('The Update Didn\'t Install'));
 }
 async function selfUpdate() {
+  if (S.selfUpdating) return;
+  S.selfUpdating = true;
   toast(t('Downloading the new RecompLauncher…'));
-  try { await invoke('update_launcher'); } catch (e) { if (!blocked('', e)) fail(e); lookForLauncher(); }
+  try {
+    if (S.os === 'linux') await invoke('update_launcher', { bigPicture: document.body.classList.contains('tv-on') });
+    else await invoke('update_launcher');
+  } catch (e) { if (!blocked('', e) && !cantReplace(e)) fail(e); lookForLauncher(); }
+  finally { S.selfUpdating = false; }
+}
+// The AppImage sits in a folder this account can't change, so it can't update itself in place.
+// Say where and why, and offer the new AppImage to download instead of a bare error.
+function cantReplace(err) {
+  const m = String(err && err.message ? err.message : err).match(/^CANT_REPLACE\|([^]*)$/);
+  if (!m) return false;
+  const url = (S.launcherUpd && S.launcherUpd.url) || `${S.site}/download`;
+  const title = t('RecompLauncher Can\'t Update Itself Here');
+  modal(`<h2>${esc(title)}</h2><p>${esc(tf('It can\'t replace itself in {folder}, because this account can\'t change that folder. Move RecompLauncher to a folder you own, like Applications in your home folder, or download the new version and use that one.', { folder: m[1] }))}</p>
+    <div class="acts grid2"><button type="button" class="btn" data-x="no">${esc(t('Not Now'))}</button><button type="button" class="btn main" data-x="go">${esc(t('Download It'))}</button></div>`, (x, close) => {
+    if (x.dataset.x !== 'go') return;
+    close();
+    invoke('open_url', { url }).catch(fail);
+  }, title);
+  return true;
 }
 
 function libChoices(libs, sel) {
@@ -5402,6 +5455,55 @@ async function steamSync(restart) {
 
 // What's waiting to go in or out of Steam, for the setting's line. Looked up again after a sync
 // or turning the setting on (false: being looked up).
+// ---------- Data Hoarder Mode ----------
+// Keeps every release of every game in the Library, with its notes, in Releases/<game>/<release>/
+// (hoard.rs does the work). Asked to look whenever something might have changed; it only acts
+// while the mode is on.
+const hoardNow = () => { if (S.settings && S.settings.hoarder) invoke('hoard_now').catch(() => {}); };
+function hoardRoot() {
+  const st = S.settings;
+  if (st.hoard_dir) return st.hoard_dir;
+  const sep = S.os === 'windows' ? '\\' : '/';
+  return st.library_dir + sep + 'Releases';
+}
+function hoardLine() {
+  const h = S.hoard;
+  if (h === undefined) { S.hoard = false; invoke('hoard_state').then((v) => { S.hoard = v; paintHoard(); }).catch(() => {}); }
+  if (!h) return t('Waiting for the first look.');
+  if (h.running && h.game) {
+    const pct = h.total ? ` ${Math.floor(Math.min(100, (h.done / h.total) * 100))}%` : '';
+    return tf('Saving {game} {release}: {file}{pct}', { game: h.game, release: h.release, file: h.file, pct });
+  }
+  if (h.running) return t('Looking for releases to save…');
+  const bits = [];
+  if (h.last_done) bits.push(tf('Last look {when}.', { when: ago(h.last_done) }));
+  if (h.saved) bits.push(tn(h.saved, '1 file saved.', '{n} files saved.'));
+  if (h.failed && h.failed.length) bits.push(tn(h.failed.length, '1 file couldn\'t be saved and will be tried again.', '{n} files couldn\'t be saved and will be tried again.'));
+  if (h.stopped) bits.push(cleanMsg(h.stopped));
+  return bits.join(' ') || t('Waiting for the first look.');
+}
+function paintHoard() {
+  const el = $('#hoard-line');
+  if (el) el.textContent = hoardLine();
+}
+function hoarderGroup(group, row, sw, st) {
+  const on = !!st.hoarder;
+  const main = row(t('Data Hoarder Mode'), t('Projects get taken down. With this on, every release of every game in your Library, installed or not, is downloaded and kept, including old ones, with its notes. Games you add to the Library are saved right away. Nothing is installed: installed games update only the usual way.'), sw('hoarder', on, t('Data Hoarder Mode')));
+  if (!on) return group(t('Data Hoarder'), main);
+  // row() escapes its description, so rows that need markup in it are written out here.
+  const markup = (b, s, ctl) => `<div class="set-row"><div class="k"><b>${esc(b)}</b><span>${s}</span></div>${ctl}</div>`;
+  const where = markup(t('Hoard folder'), `<b class="path">${esc(hoardRoot())}</b> · ${esc(t('Releases/Game/Release/, with each release\'s notes as RELEASE-NOTES.md.'))}`,
+    `<span class="acts"><button type="button" class="btn sm" data-act="folder" data-path="${esc(hoardRoot())}">${esc(t('Open'))}</button><button type="button" class="btn sm" data-act="hoard-dir">${esc(t('Change'))}</button>${st.hoard_dir ? `<button type="button" class="btn sm" data-act="hoard-dir-reset">${esc(t('Reset'))}</button>` : ''}</span>`);
+  const mine = row(t('Only builds for this PC'), t('Off: every platform\'s files are kept. On: only the ones that run on this PC, which takes far less room.'), sw('hoard_this_pc_only', !!st.hoard_this_pc_only, t('Only builds for this PC')));
+  const keep = st.hoard_keep || 'all';
+  const keepSel = `<select class="sel" data-act="hoard-keep" aria-label="${esc(t('Releases to keep'))}">${[['all', t('All releases')], ['latest', t('Latest release only')], ['count', t('Latest releases, a number')]].map(([k, n]) => `<option value="${k}"${keep === k ? ' selected' : ''}>${esc(n)}</option>`).join('')}</select>`;
+  const countBox = keep === 'count' ? `<input class="field sm" id="hoard-count" type="number" min="1" max="999" value="${Number(st.hoard_count) || 5}" aria-label="${esc(t('How many releases'))}" style="width:5em">` : '';
+  const which = row(t('Releases to keep'), t('All keeps every release, old ones too. Latest keeps only the newest. A number keeps that many of the newest. Releases already saved are never deleted.'), `<span class="acts">${keepSel}${countBox}</span>`);
+  const now = markup(t('Save Now'), `<span id="hoard-line">${esc(hoardLine())}</span>`, `<button type="button" class="btn sm" data-act="hoard-now">${esc(t('Save Now'))}</button>`);
+  return group(t('Data Hoarder'), main + where + which + mine + now);
+}
+T.event.listen('hoard', ({ payload }) => { S.hoard = payload; paintHoard(); });
+
 function steamSyncLine() {
   const st = S.steamSyncState;
   if (st === undefined) { S.steamSyncState = false; invoke('steam_sync_state').then((v) => { S.steamSyncState = v; if (S.view === 'settings' && S.setTab === 'library') setSection('library', false); }).catch(() => {}); }
@@ -5595,12 +5697,15 @@ async function lookForLauncher(atStart) {
   renderSide();
 }
 
+// An update restart returns to the mode that was on screen.
+function startsInTV() { return !S.desktopArg && !!(S.settings.start_in_tv || S.bigArg); }
+
 // The update screen at start: not during first-time setup, in Big Picture, with a game running
 // (started from a shortcut) or a window already open (a game link, a Set Up), and not for a
 // version the player put off with Later, unless that version is required.
 function startUpdateDue(v) {
   if (!v || !v.version || !S.settings.setup_done) return false;
-  if (document.body.classList.contains('tv-on') || S.bigArg || S.settings.start_in_tv) return false;
+  if (document.body.classList.contains('tv-on') || startsInTV()) return false;
   if ((S.running && S.running.size) || $('.scrim') || $('.upd-start')) return false;
   return !!v.required || (S.settings.ui || {}).upd_later !== v.version;
 }
@@ -6839,6 +6944,7 @@ async function act(el, e) {
   if (/^beta-/.test(a) && window.moreAct) return window.moreAct(a, el);
   if (a === 'project-association') return changeProject(id);
   if (a === 'adopt' && window.adoptAct) return window.adoptAct(a, el);
+  if (/^mig-/.test(a) && window.migrateAct) return window.migrateAct(a, el);
   switch (a) {
     case 'open': e.preventDefault(); closeMenu(); return go('game', id, el.closest('.tile') ? el : null);
     case 'back': return back();
@@ -6939,6 +7045,13 @@ async function act(el, e) {
     }
     case 'self-steam': return selfToSteam(false);
     case 'steam-sync': return steamSync(false);
+    case 'hoard-now': hoardNow(); toast(t('Looking for releases to save.')); return;
+    case 'hoard-dir': {
+      const p = await pickFile({ title: t('Where Data Hoarder Mode keeps releases'), directory: true, defaultPath: hoardRoot() }).catch(fail);
+      if (p) await saveSettings({ hoard_dir: typeof p === 'string' ? p : p.path });
+      return;
+    }
+    case 'hoard-dir-reset': return saveSettings({ hoard_dir: null });
     case 'ge-proton': return geInstall();
     case 'use-proton': return useProton(id);
     case 'readme': { S.readmeOpen = !S.readmeOpen; const c = el.closest('.rdm'); if (c) { c.classList.toggle('open', S.readmeOpen); el.setAttribute('aria-expanded', String(S.readmeOpen)); } return; }
@@ -7560,7 +7673,7 @@ T.event.listen('install', ({ payload: p }) => {
     delete DLSPD[id];
     ENDED[id] = Date.now();
     S.recent = [p].concat(S.recent.filter((r) => r.id !== id)).slice(0, 20);
-    if (p.phase === 'done') S.dlHist = null;
+    if (p.phase === 'done') { S.dlHist = null; hoardNow(); }
     const name = byId(id)?.name || id;
     if (p.phase === 'done') {
       delete S.updates[id]; delete S.mods[id]; delete S.setup[id]; loadNews();
@@ -7764,7 +7877,7 @@ T.event.listen('screenshot', ({ payload: p }) => { delete S.shots[p.id]; forgetL
   // The first time: the setup, like a new console. After that, TV mode if that's how they play.
   if (document.readyState === 'loading') await new Promise((ok) => addEventListener('DOMContentLoaded', ok, { once: true }));
   if (!S.settings.setup_done && window.firstRun) window.firstRun();
-  else if (window.startTV && (S.settings.start_in_tv || S.bigArg)) window.startTV();
+  else if (window.startTV && startsInTV()) window.startTV();
   else setTimeout(askData, 800);
   // The window opens only now, with the first real screen already drawn (two frames: the draw, then its paint).
   // A hidden window may not get frames at all, so a short timer opens it too, whichever comes first;
@@ -7774,7 +7887,7 @@ T.event.listen('screenshot', ({ payload: p }) => { delete S.shots[p.id]; forgetL
   requestAnimationFrame(() => requestAnimationFrame(ready));
   setTimeout(ready, 150);
   // Started by a game link from the website: that game's page.
-  invoke('take_link').then((id) => { if (id) setTimeout(() => openLinkedGame(id), window.startTV && (S.settings.start_in_tv || S.bigArg) ? 1600 : 0); }).catch(() => {});
+  invoke('take_link').then((id) => { if (id) setTimeout(() => openLinkedGame(id), window.startTV && startsInTV() ? 1600 : 0); }).catch(() => {});
   // A shortcut asked to play a recomp that still needs setting up: its Set Up window.
-  invoke('take_setup_asked').then((id) => { if (id) setTimeout(() => setupReqModal(id), window.startTV && (S.settings.start_in_tv || S.bigArg) ? 1600 : 0); }).catch(() => {});
+  invoke('take_setup_asked').then((id) => { if (id) setTimeout(() => setupReqModal(id), window.startTV && startsInTV() ? 1600 : 0); }).catch(() => {});
 })();
