@@ -21,7 +21,7 @@ function settingsContext(settings, setTab = 'updates') {
     tf: (s, values) => s.replace(/\{(\w+)\}/g, (_, k) => values[k]),
     LANGS: [['en', 'English']], systemLang: () => 'en',
     SET_SECTIONS: [['updates', 'Updates']], SET_ICONS: {}, DL_LIMITS: [0],
-    okMark: () => '', portableRow: () => '', geRow: () => '', networkGroup: () => '',
+    okMark: () => '', portableRow: () => '', geRow: () => '', networkGroup: () => '', hoarderGroup: () => '',
     backdrop: () => '', bar: () => '', region: (s) => s, pageHead: (s) => s,
     homePinned: () => false, bgMode: () => '', langName: () => 'English',
     svg: () => '', hints: () => '', HEART: '',
