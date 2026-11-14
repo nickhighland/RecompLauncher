@@ -327,6 +327,11 @@ pub struct Settings {
     /// finishes downloading (an update too), its setup opens straight away. Off: it waits for Set Up.
     #[serde(default = "yes")]
     pub auto_install: bool,
+    /// Settings → RecompLauncher Updates: the launcher looks for a new version of itself (when it
+    /// opens, every few hours, and when the website pushes one) and offers it. Off: it never looks
+    /// or asks by itself; Check for Updates in the side menu still does.
+    #[serde(default = "yes")]
+    pub launcher_updates: bool,
 }
 
 fn keep_all() -> String {
@@ -410,6 +415,7 @@ impl Default for Settings {
             hoard_keep: keep_all(),
             hoard_count: five(),
             auto_install: true,
+            launcher_updates: true,
         }
     }
 }
@@ -669,6 +675,16 @@ mod tests {
         assert!(super::Settings::default().auto_install);
         let settings: super::Settings = serde_json::from_str(r#"{"library_dir":"/games"}"#).unwrap();
         assert!(settings.auto_install);
+    }
+
+    #[test]
+    fn launcher_updates_are_on_by_default_and_for_settings_saved_before_the_switch() {
+        assert!(super::Settings::default().launcher_updates);
+        let settings: super::Settings = serde_json::from_str(r#"{"library_dir":"/games"}"#).unwrap();
+        assert!(settings.launcher_updates);
+        let off: super::Settings = serde_json::from_str(r#"{"library_dir":"/games","launcher_updates":false}"#).unwrap();
+        let restored: super::Settings = serde_json::from_str(&serde_json::to_string(&off).unwrap()).unwrap();
+        assert!(!restored.launcher_updates);
     }
 
     #[test]
